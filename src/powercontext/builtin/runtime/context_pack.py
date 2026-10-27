@@ -107,6 +107,50 @@ def _validate_items(items: tuple[bytes, ...]) -> tuple[bytes, ...]:
     return items
 
 
+def _flush_chunk(chunks: list[bytes], current: list[str]) -> None:
+    if current:
+        chunks.append("".join(current).encode("utf-8"))
+        current.clear()
+
+
+def _append_character(
+    character: str,
+    chunks: list[bytes],
+    current: list[str],
+    current_bytes: int,
+    chunk_bytes: int,
+) -> int:
+    encoded = character.encode("utf-8")
+    if len(encoded) > chunk_bytes:
+        raise ContextPackError("chunk_bytes cannot fit one UTF-8 character")
+    if current and current_bytes + len(encoded) > chunk_bytes:
+        _flush_chunk(chunks, current)
+        current_bytes = 0
+    current.append(character)
+    return current_bytes + len(encoded)
+
+
+def _split_content(content: str, chunk_bytes: int) -> tuple[bytes, ...]:
+    chunks: list[bytes] = []
+    current: list[str] = []
+    current_bytes = 0
+    for line in content.splitlines(keepends=True):
+        line_bytes = len(line.encode("utf-8"))
+        if line_bytes > chunk_bytes:
+            _flush_chunk(chunks, current)
+            current_bytes = 0
+            for character in line:
+                current_bytes = _append_character(character, chunks, current, current_bytes, chunk_bytes)
+        else:
+            if current and current_bytes + line_bytes > chunk_bytes:
+                _flush_chunk(chunks, current)
+                current_bytes = 0
+            current.append(line)
+            current_bytes += line_bytes
+    _flush_chunk(chunks, current)
+    return tuple(chunks)
+
+
 def _pack_unsigned(items: tuple[bytes, ...]) -> dict[str, object]:
     return {"schema": _PACK_SCHEMA, "items": [base64.b64encode(item).decode("ascii") for item in items]}
 
@@ -142,31 +186,17 @@ class ContextPack:
 
     @classmethod
     def from_content(cls, content: str, *, chunk_bytes: int = 512) -> ContextPack:
-        """Split text deterministically on character boundaries within the byte limit."""
+        """Split text deterministically at line boundaries within the byte limit."""
 
         if not isinstance(content, str):
             raise ContextPackError("content must be a string")
         if type(chunk_bytes) is not int or chunk_bytes <= 0:
             raise ContextPackError("chunk_bytes must be a positive integer")
         try:
-            chunks: list[bytes] = []
-            current: list[str] = []
-            current_bytes = 0
-            for character in content:
-                encoded = character.encode("utf-8")
-                if len(encoded) > chunk_bytes:
-                    raise ContextPackError("chunk_bytes cannot fit one UTF-8 character")
-                if current and current_bytes + len(encoded) > chunk_bytes:
-                    chunks.append("".join(current).encode("utf-8"))
-                    current = []
-                    current_bytes = 0
-                current.append(character)
-                current_bytes += len(encoded)
-            if current:
-                chunks.append("".join(current).encode("utf-8"))
+            chunks = _split_content(content, chunk_bytes)
         except UnicodeError as error:
             raise ContextPackError("content must be valid UTF-8 text") from error
-        return cls.build(tuple(chunks))
+        return cls.build(chunks)
 
     def to_bytes(self) -> bytes:
         """Return the canonical complete Pack JSON wire representation."""
