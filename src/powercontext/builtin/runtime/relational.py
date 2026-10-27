@@ -1421,6 +1421,13 @@ class RelationalContexts:
         )
         return self._contexts.setdefault(scope, context)
 
+    def lifecycle_memory(self, scope_id: str, connection: AsyncConnection) -> MemoryService:
+        """Bind lifecycle state changes and native Memory commits to one transaction."""
+
+        services = self._services_for(scope_id)
+        _, catalog = services.sources(connection)
+        return services.memory(catalog, connection)
+
     def _services_for(self, scope_id: str) -> _ScopedServices:
         scope = validate_scope_id(scope_id)
         return _ScopedServices(
