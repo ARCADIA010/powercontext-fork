@@ -23,7 +23,7 @@ from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
 from powercontext.builtin.persistence.supervision import ArtifactProcessingFence, ArtifactProcessingLeaseRepository
-from powercontext.builtin.persistence.tables import PROFILE_POLICIES_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+from powercontext.builtin.persistence.tables import PROFILE_POLICIES_TABLE, SOURCE_JOURNAL_HEADS_TABLE, SOURCES_TABLE
 
 
 async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[str, ...]) -> frozenset[str]:
@@ -43,6 +43,35 @@ async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[s
         .with_for_update()
     )
     return frozenset(rows)
+
+
+async def pending_source_count_scopes(
+    connection: AsyncConnection, scope_ids: tuple[str, ...], *, binding_name: str, threshold: int
+) -> frozenset[str]:
+    """Qualify a bounded page using only cursor and indexed journal metadata.
+
+    Count identities, including lineage-only rows, without reading payloads or
+    assuming journal positions remain contiguous after imports or rollback.
+    The caller holds each intent lock through this check and admission.
+    """
+
+    cursors = await SourceCursorRepository().load_many(connection, scope_ids, binding_name)
+    eligible: set[str] = set()
+    for scope in scope_ids:
+        cursor = cursors.get(scope)
+        after = 0 if cursor is None else cursor.cursor.sequence
+        # Only the threshold-th identity matters; the unique (scope, position)
+        # index bounds the returned metadata to one row without decoding Sources.
+        reached = await connection.scalar(
+            select(SOURCES_TABLE.c.journal_position)
+            .where(SOURCES_TABLE.c.scope_id == scope, SOURCES_TABLE.c.journal_position > after)
+            .order_by(SOURCES_TABLE.c.journal_position)
+            .offset(threshold - 1)
+            .limit(1)
+        )
+        if reached is not None:
+            eligible.add(scope)
+    return frozenset(eligible)
 
 
 class SourceProcessingPendingProvider:

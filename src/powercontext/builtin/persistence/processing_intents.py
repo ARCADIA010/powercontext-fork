@@ -209,6 +209,25 @@ class ArtifactProcessingIntentRepository:
             or 0
         )
 
+    async def admit_pending(
+        self, connection: AsyncConnection, scope_id: str, binding_name: str, /
+    ) -> StoredArtifactProcessingIntent:
+        """Coalesce count-qualified dirty work without advancing a time scan.
+
+        The caller validates its fence, locks the intent, and checks the domain
+        threshold in the same transaction. Accepted work keeps its generation
+        so a simultaneous time condition or explicit request cannot duplicate it.
+        """
+
+        current = await self.load(connection, scope_id, binding_name, for_update=True)
+        if current is None:
+            raise InvalidRepositoryArgumentError("scope_id", "automatic member is not registered")
+        if current.dirty_generation > current.clean_generation and (
+            current.requested_generation == current.handled_generation
+        ):
+            return await self.request(connection, scope_id, binding_name)
+        return current
+
     async def admit(
         self,
         connection: AsyncConnection,

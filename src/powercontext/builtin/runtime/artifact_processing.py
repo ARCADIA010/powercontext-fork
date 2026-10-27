@@ -118,6 +118,9 @@ class ArtifactProcessingBinding:
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
 
+    # An independent OR admission channel; never applied to accepted requests.
+    source_count_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
+
     def __post_init__(self) -> None:
         if not self.binding_name or self.binding_name != self.binding_name.strip():
             raise ValueError("binding_name must be nonempty and trimmed")  # noqa: TRY003
@@ -394,6 +397,9 @@ class _FamilyState:
     requested_after: int = 0
     scan_after: int = 0
     scan_generation: int = 0
+    count_after: int = 0
+    count_upper: int | None = None
+    next_count_at: float = 0.0
     scan_in_progress: bool = False
     reconcile_after: str | None = None
     reconcile_complete: bool = False
@@ -401,7 +407,7 @@ class _FamilyState:
     discovery_pending: bool = True
     next_schedule_at: float | None = None
     next_discovery_at: float = 0.0
-    automatic_next: bool = False
+    discovery_channel: int = 0
     overflow_not_before: float = 0.0
     degraded: bool = False
     completed: int = 0
@@ -514,6 +520,7 @@ class ArtifactProcessingSupervisor:
         for name, state in self._families.items():
             if binding_name is None or binding_name == name:
                 state.discovery_pending = True
+                state.next_count_at = 0.0
         self._wake.set()
 
     async def close(self) -> None:
@@ -648,20 +655,22 @@ class ArtifactProcessingSupervisor:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
             state.reconcile_complete = True
-        # Alternate discovery channels so explicit traffic cannot monopolize admission.
-        state.automatic_next = not state.automatic_next
-        if state.automatic_next:
-            await self._discover_automatic(state)
-            await self._discover_requested(state)
-        else:
-            await self._discover_requested(state)
-            await self._discover_automatic(state)
+        # Each channel gets first access to bounded capacity in turn.
+        channels = (self._discover_requested, self._discover_automatic, self._discover_count)
+        first = state.discovery_channel
+        state.discovery_channel = (first + 1) % len(channels)
+        for discover in channels[first:] + channels[:first]:
+            await discover(state)
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
         if capacity <= 0:
             return
-        if not state.discovery_pending and self._lease_mode == "single-process":
+        if (
+            not state.discovery_pending
+            and self._lease_mode == "single-process"
+            and state.binding.source_count_scope_filter is None
+        ):
             return
         if state.requested_after == 0:
             state.notification_at_start = self._notifications
@@ -779,6 +788,55 @@ class ArtifactProcessingSupervisor:
         state.scan_in_progress = scan_in_progress
         state.next_schedule_at = next_schedule_at
         state.next_discovery_at = next_discovery_at
+        for scope in admitted:
+            self._enqueue(state, scope)
+
+    async def _discover_count(self, state: _FamilyState) -> None:
+        qualify = state.binding.source_count_scope_filter
+        capacity = self._fresh_capacity(state)
+        loop = asyncio.get_running_loop()
+        if qualify is None or capacity <= 0 or loop.time() < state.next_count_at:
+            return
+        after, upper = state.count_after, state.count_upper
+        limit = min(capacity, _DISCOVERY_PAGE_SIZE)
+        admitted: list[str] = []
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            if upper is None:
+                upper = await self._intents.max_sequence(connection, state.binding.binding_name)
+            rows = await self._intents.scan(
+                connection,
+                state.binding.binding_name,
+                after_sequence=after,
+                upper_sequence=upper,
+                limit=limit,
+                dirty_only=True,
+            )
+            candidates: list[str] = []
+            for row in rows:
+                if row.scope_id in state.queued or row.scope_id in state.running or row.scope_id in state.retries:
+                    continue
+                # Serialize the count snapshot with processor completion and
+                # explicit requests before reading the successful cursor.
+                current = await self._intents.load(
+                    connection, row.scope_id, state.binding.binding_name, for_update=True
+                )
+                if current is not None and current.dirty_generation > current.clean_generation:
+                    candidates.append(row.scope_id)
+            eligible = await qualify(connection, tuple(candidates))
+            for scope in candidates:
+                if scope in eligible:
+                    await self._intents.admit_pending(connection, scope, state.binding.binding_name)
+                    admitted.append(scope)
+        # A rollback must retain both the page frontier and the ready queue.
+        # Even wholly unqualified pages advance; stable rows are revisited on
+        # the next bounded pass, with a periodic fallback for lost notifications.
+        if len(rows) == limit:
+            state.count_after, state.count_upper = rows[-1].pending_sequence, upper
+            state.next_count_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
+        else:
+            state.count_after, state.count_upper = 0, None
+            state.next_count_at = loop.time() + self._tick
         for scope in admitted:
             self._enqueue(state, scope)
 
@@ -1059,6 +1117,7 @@ class ArtifactProcessingSupervisor:
             state.retries.clear()
             state.requested_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
+            state.count_after, state.count_upper, state.next_count_at = 0, None, 0.0
             state.discovery_pending = True
 
     async def _reap_unconfirmed_exits(self) -> None:
@@ -1091,6 +1150,8 @@ class ArtifactProcessingSupervisor:
             if state.overflow_not_before > now:
                 deadlines.append(state.overflow_not_before)
                 continue
+            if state.binding.source_count_scope_filter is not None:
+                deadlines.append(state.next_count_at)
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
