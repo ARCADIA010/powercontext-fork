@@ -1,0 +1,177 @@
+[
+  {
+    "split": "dev",
+    "id": "earnings",
+    "question": "How much net revenue and gross profit did PepsiCo report for 2022 versus 2021 in its consolidated earnings statement?",
+    "evidence_pages": [
+      62
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "cash-and-earnings",
+    "question": "Which cash flow statement lines show 2022 capital expenditure and depreciation and amortisation, and which earnings statement shows operating income for EBITDA?",
+    "evidence_pages": [
+      62,
+      64
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "abbreviations",
+    "question": "Where can an analyst find the D&A figure alongside capex for 2022 and 2021?",
+    "evidence_pages": [
+      64
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "geography",
+    "question": "Which seven business divisions cover PepsiCo's international geographic footprint?",
+    "evidence_pages": [
+      4,
+      5,
+      69
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "legal",
+    "question": "Does management believe pending lawsuits and regulatory investigations could materially damage financial condition or cash flows?",
+    "evidence_pages": [
+      26
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "recognition",
+    "question": "When does control pass to customers so that beverage and snack sales can be booked as revenue?",
+    "evidence_pages": [
+      74
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "leases",
+    "question": "What are the annual operating rental obligations due in 2023 through 2027 and the amount due later?",
+    "evidence_pages": [
+      106
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "fixed-assets",
+    "question": "What were the gross cost and accumulated depreciation of factories and equipment in 2022 versus 2021?",
+    "evidence_pages": [
+      110
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "restructuring",
+    "question": "How much restructuring was charged and how much cash was paid in 2022 versus 2021 under the productivity plan?",
+    "evidence_pages": [
+      79
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "transition-tax",
+    "question": "How much transition tax remains unpaid at the end of 2022 and what payment is expected in 2023?",
+    "evidence_pages": [
+      84
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "cost-policy",
+    "question": "How large were advertising and shipping costs in 2022 and 2021, and where were they classified?",
+    "evidence_pages": [
+      76
+    ]
+  },
+  {
+    "split": "dev",
+    "id": "credit-lines",
+    "question": "What borrowing capacity and expiration dates apply to the five-year and 364-day credit facilities?",
+    "evidence_pages": [
+      98
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "per-share",
+    "question": "What were basic and diluted earnings per share in 2022 compared with 2020?",
+    "evidence_pages": [
+      62
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "financial-position",
+    "question": "Where are total current assets and total current liabilities at the end of 2022 compared with 2021?",
+    "evidence_pages": [
+      66
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "capital-returns",
+    "question": "How much was paid for dividends and common stock repurchases during each of 2022 and 2021?",
+    "evidence_pages": [
+      65
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "foreign-currency",
+    "question": "What share of 2022 sales arose outside the US, and how many percentage points did currency movements reduce growth?",
+    "evidence_pages": [
+      38
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "benefits",
+    "question": "What pension and retiree medical benefits are projected to be paid between 2023 and 2032?",
+    "evidence_pages": [
+      94
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "divestiture",
+    "question": "What proceeds and retained ownership resulted from selling the Tropicana and Naked juice operations?",
+    "evidence_pages": [
+      107
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "country-sales",
+    "question": "Compare 2022 sales in Mexico and China with 2021, alongside their long-lived assets.",
+    "evidence_pages": [
+      74
+    ]
+  },
+  {
+    "split": "heldout",
+    "id": "profit-driver",
+    "question": "What was operating profit in 2022 versus 2021 and what drove the change?",
+    "evidence_pages": [
+      40
+    ]
+  },
+  {
+    "split": "negative",
+    "id": "unmatched",
+    "question": "Quasistellar neutrino antimatter propulsion telemetry?",
+    "evidence_pages": []
+  },
+  {
+    "split": "negative",
+    "id": "entity-only",
+    "question": "What uranium isotope enrichment capacity did PepsiCo operate in 2022?",
+    "evidence_pages": []
+  }
+]

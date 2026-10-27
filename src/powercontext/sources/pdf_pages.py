@@ -8,6 +8,8 @@ import json
 import math
 import re
 from collections import Counter
+from dataclasses import dataclass
+from itertools import pairwise
 
 from pydantic import BaseModel, Field, field_validator
 from pypdf import PdfReader
@@ -29,7 +31,7 @@ class PDFDocumentInput(BaseModel):
     @classmethod
     def validate_document_id(cls, value: str) -> str:
         if not value.strip():
-            raise ValueError("document_id must not be empty or blank")
+            raise ValueError("document_id must not be empty or blank")  # noqa: TRY003
         return value
 
 
@@ -50,7 +52,7 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     try:
         reader = PdfReader(io.BytesIO(value.content), strict=True)
         if reader.is_encrypted and not reader.decrypt(""):
-            raise ValueError("PDF requires a nonempty password")
+            raise ValueError("PDF requires a nonempty password")  # noqa: TRY003, TRY301
         digest = hashlib.sha256(value.content).hexdigest()
         return tuple(
             PDFPageInput(
@@ -64,7 +66,7 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     except Exception as error:
         # pypdf exposes malformed structures through several exception families,
         # including failures encountered only while decoding a later page stream.
-        raise ValueError("Invalid or incompletely readable PDF document") from error
+        raise ValueError("Invalid or incompletely readable PDF document") from error  # noqa: TRY003
 
 
 class PDFPageSource(Source):
@@ -122,10 +124,13 @@ PDF_PAGE_SOURCE_DEFINITION: SourceDefinition[PDFPageInput, PDFPageSource, PDFPag
 
 
 _STOP_WORDS = frozenset(
-    "a an the and or of to in on at by for from with as is are was were be been being "
+    "a an the and or of to in on at by for from with as is are was were be been being "  # noqa: SIM905
     "do does did has have had what which who when where why how much many "
     "can could would should will please tell me about according report annual "
-    "company fiscal year years during between compared calculate its it this that these those".split()
+    "company fiscal year years during between compared calculate its it this that these those "
+    "s d analyst find figure alongside show shows shown using use details assuming perspective "
+    "respond response answer based value number amount state explicitly outlined quantity "
+    "give provide reported reporting versus vs".split()
 )
 
 
@@ -137,7 +142,25 @@ def _terms(text: str) -> list[str]:
     return result
 
 
+# Query aliases are financial vocabulary, independent of document identity or page.
+# They only affect retrieval; captured Source text and exact citations stay original.
+_CONCEPT_ALIASES = (
+    ("capex", "capital expenditure", "capital expenditures", "capital spending"),
+    ("d&a", "depreciation and amortization", "depreciation and amortisation"),
+    ("operating income", "operating profit"),
+    ("income statement", "statement of income", "earnings statement", "p&l", "profit and loss"),
+    ("cash flow statement", "statement of cash flows"),
+    ("segment", "segments", "division", "divisions"),
+    ("geography", "geographies", "geographic", "footprint", "regions", "countries", "territories"),
+    ("lawsuit", "lawsuits", "litigation", "legal proceedings"),
+    ("rental", "rentals", "lease", "leases"),
+    ("buyback", "buybacks", "repurchase", "repurchases"),
+    ("eps", "earnings per share"),
+)
+
+
 def _lexeme(term: str) -> str:
+    term = term.replace("isation", "ization")
     if len(term) > 4 and term.endswith("ies"):
         return term[:-3] + "y"
     if len(term) > 4 and term.endswith("s") and not term.endswith(("ss", "us")):
@@ -145,74 +168,130 @@ def _lexeme(term: str) -> str:
     return term
 
 
-async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
-    """Retrieve through scoped Memory FTS, then rank full pages with lexical BM25.
+def _contains_phrase(text: str, phrase: str) -> bool:
+    return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text) is not None
 
-    Single-term searches avoid the shared long-query admission floor discarding
-    pages that provide just one part of a multi-page financial question. No global
-    corpus cache is retained, so revisions and independent scopes cannot leak.
-    """
 
-    if limit <= 0 or not question.strip():
-        return ()
-    terms = list(dict.fromkeys(term for term in _terms(question) if term not in _STOP_WORDS))
-    if not terms:
-        return ()
+def _query_plan(question: str) -> tuple[list[str], dict[str, float], tuple[tuple[str, ...], ...]]:
+    normalized = re.sub(r"\bfy(?=\d{4}\b)", "", question.casefold())
+    terms = list(dict.fromkeys(term for term in _terms(normalized) if term not in _STOP_WORDS))
+    weights = {_lexeme(term): 1.0 for term in terms}
+    aliases = tuple(group for group in _CONCEPT_ALIASES if any(_contains_phrase(normalized, alias) for alias in group))
     queries = [question]
     for term in terms:
         queries.append(term)
         stem = _lexeme(term)
         if stem != term:
             queries.append(stem)
+    for group in aliases:
+        queries.extend(group)
+        for alias in group:
+            for term in _terms(alias):
+                if term not in _STOP_WORDS:
+                    weights.setdefault(_lexeme(term), 0.65)
+    return list(dict.fromkeys(queries)), weights, aliases
+
+
+@dataclass(frozen=True)
+class _PageCandidate:
+    citation: MemoryCitation
+    counts: Counter[str]
+    text: str
+
+
+async def _retrieve_pages(memory, queries: list[str], limit: int) -> list[_PageCandidate]:
     candidates = {}
-    for query in dict.fromkeys(queries):
+    for query in queries:
         page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=max(80, limit * 5)))
         for hit in page.hits:
-            # ArtifactRef is a mutable Pydantic value; serialize the address for keys.
             key = (hit.memory_ref.model_dump_json(), hit.entry_id, hit.entry_version_id)
             if key in candidates:
                 continue
             citation = MemoryCitation(
                 memory_ref=hit.memory_ref, entry_id=hit.entry_id, entry_version_id=hit.entry_version_id
             )
-            record = await memory.get(GetMemoryEntryRequest(citation=citation))
-            references = tuple(ref for ref in record.entry.sources if ref.source_type == "pdf-page")
-            if len(references) != 1 or len(record.entry.sources) != 1:
-                continue
-            body = record.entry.text.partition("\n")[2]
-            counts = Counter(_lexeme(term) for term in _terms(body))
-            candidates[key] = (citation, references[0].source_id, counts, body.casefold())
-    if not candidates:
-        return ()
-    query_terms = set(_lexeme(term) for term in terms)
-    values = list(candidates.values())
-    average_length = sum(sum(item[2].values()) for item in values) / len(values) or 1
-    frequencies = Counter(term for item in values for term in query_terms if term in item[2])
+            body = hit.text.partition("\n")[2]
+            candidates[key] = _PageCandidate(
+                citation, Counter(_lexeme(term) for term in _terms(body)), " ".join(body.casefold().split())
+            )
+    return list(candidates.values())
 
-    def score(item):
-        counts = item[2]
-        length = sum(counts.values())
+
+def _rank_pages(
+    values: list[_PageCandidate],
+    weights: dict[str, float],
+    aliases: tuple[tuple[str, ...], ...],
+    question: str,
+) -> list[_PageCandidate]:
+    average_length = sum(sum(item.counts.values()) for item in values) / len(values) or 1
+    frequencies = Counter(term for item in values for term in weights if term in item.counts)
+    original_terms = [term for term in _terms(question) if term not in _STOP_WORDS]
+
+    def score(item: _PageCandidate) -> float:
+        length = sum(item.counts.values())
         total = 0.0
-        for term in query_terms:
-            frequency = counts[term]
+        for term, weight in weights.items():
+            frequency = item.counts[term]
             if not frequency:
                 continue
             inverse_frequency = math.log(1 + (len(values) - frequencies[term] + 0.5) / (frequencies[term] + 0.5))
-            weight = 0.25 if term.isdigit() else 1.0
-            total += weight * inverse_frequency * frequency * 2.2 / (
-                frequency + 1.2 * (0.25 + 0.75 * length / average_length)
+            if term.isdigit():
+                weight *= 0.25
+            total += (
+                weight
+                * inverse_frequency
+                * frequency
+                * 2.2
+                / (frequency + 1.2 * (0.25 + 0.75 * length / average_length))
             )
-        # Adjacent content terms reward financial concepts over scattered mentions.
-        total += sum(0.35 for left, right in zip(terms, terms[1:]) if f"{left} {right}" in item[3])
+        total += sum(0.35 for left, right in pairwise(original_terms) if f"{left} {right}" in item.text)
+        for group in aliases:
+            total += max(
+                (1.0 + 0.4 * (" " in alias) for alias in group if _contains_phrase(item.text, alias)), default=0
+            )
+            # A statement title near the start is stronger evidence than a passing
+            # reference to that statement in a long note or policy discussion.
+            total += max((5.0 for alias in group if _contains_phrase(item.text[:256], alias)), default=0)
         return total
 
-    ranked = sorted(values, key=lambda item: (-score(item), item[1]))
+    return sorted(values, key=lambda item: (-score(item), item.citation.entry_id))
+
+
+async def _select_pages(
+    memory, ranked: list[_PageCandidate], weights: dict[str, float], limit: int
+) -> tuple[MemoryCitation, ...]:
     selected, seen = [], set()
-    for citation, source_id, counts, _ in ranked:
-        if source_id in seen or not query_terms.intersection(counts):
+    for item in ranked:
+        if not weights.keys() & item.counts.keys():
+            continue
+        record = await memory.get(GetMemoryEntryRequest(citation=item.citation))
+        if len(record.entry.sources) != 1 or record.entry.sources[0].source_type != "pdf-page":
+            continue
+        source_id = record.entry.sources[0].source_id
+        if source_id in seen:
             continue
         seen.add(source_id)
-        selected.append(citation)
+        selected.append(item.citation)
         if len(selected) == limit:
             break
     return tuple(selected)
+
+
+async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
+    """Retrieve scoped Memory evidence and rank pages with financial query aliases.
+
+    Single-term routes retain partial evidence for multi-page questions. Candidate
+    text comes from public search hits; selected pages undergo exact get and Source
+    validation. No Source text is rewritten or external PDF opened during search.
+    """
+
+    if limit <= 0 or not question.strip():
+        return ()
+    queries, weights, aliases = _query_plan(question)
+    if not weights:
+        return ()
+    candidates = await _retrieve_pages(memory, queries, limit)
+    if not candidates:
+        return ()
+    ranked = _rank_pages(candidates, weights, aliases, question)
+    return await _select_pages(memory, ranked, weights, limit)
