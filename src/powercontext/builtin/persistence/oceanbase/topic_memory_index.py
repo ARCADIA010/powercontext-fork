@@ -53,6 +53,7 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemorySearchChannels,
     TopicMemorySearchRequest,
 )
+from powercontext.builtin.persistence.source_lifecycle import lifecycle_topic_eligible, topic_eligible_sql
 from powercontext.builtin.persistence.tables import (
     TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
     TOPIC_MEMORY_ACTIVE_TOPICS_TABLE,
@@ -93,6 +94,7 @@ WITH candidates AS (
     FROM pc_topic_memory_vector_topics AS v
     WHERE v.scope_id = :scope_id
       AND v.profile_fingerprint = :profile_fingerprint
+      AND {eligible}
     ORDER BY l2_distance(v.embedding, :query_vector) APPROXIMATE
     LIMIT :candidate_limit
 )
@@ -109,6 +111,7 @@ WITH neighbors AS (
     FROM pc_topic_memory_vector_chunks AS v
     WHERE v.scope_id = :scope_id
       AND v.profile_fingerprint = :profile_fingerprint
+      AND {eligible}
     ORDER BY l2_distance(v.embedding, :query_vector) APPROXIMATE
     LIMIT :neighbor_limit
 ), ranked AS (
@@ -185,6 +188,7 @@ class OceanBaseTopicMemoryFTSIndex:
             .select_from(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE)
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                lifecycle_topic_eligible(scope_id, TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id),
                 topic_score,
             )
         )
@@ -193,6 +197,7 @@ class OceanBaseTopicMemoryFTSIndex:
             .select_from(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE)
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                lifecycle_topic_eligible(scope_id, TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id),
                 topic_score,
                 topic_coverage,
             )
@@ -207,6 +212,7 @@ class OceanBaseTopicMemoryFTSIndex:
                 )
                 .where(
                     TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                    lifecycle_topic_eligible(scope_id, TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id),
                     topic_score,
                     topic_coverage,
                 )
@@ -258,6 +264,7 @@ class OceanBaseTopicMemoryFTSIndex:
             )
             .where(
                 TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.scope_id == scope_id,
+                lifecycle_topic_eligible(scope_id, TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.artifact_id),
                 chunk_score,
             )
             .subquery()
@@ -374,8 +381,12 @@ class OceanBaseTopicMemoryVectorIndex:
             params="distance=l2,type=hnsw",
         )
         vector_type = VECTOR(profile.dimension)
-        self._topic_search = text(_TOPIC_VECTOR_SEARCH).bindparams(bindparam("query_vector", type_=vector_type))
-        self._chunk_search = text(_CHUNK_VECTOR_SEARCH).bindparams(bindparam("query_vector", type_=vector_type))
+        self._topic_search = text(_TOPIC_VECTOR_SEARCH.format(eligible=topic_eligible_sql("v"))).bindparams(
+            bindparam("query_vector", type_=vector_type)
+        )
+        self._chunk_search = text(_CHUNK_VECTOR_SEARCH.format(eligible=topic_eligible_sql("v"))).bindparams(
+            bindparam("query_vector", type_=vector_type)
+        )
 
     async def initialize(self, connection: AsyncConnection, /) -> None:
         if connection.dialect.name != "mysql":
