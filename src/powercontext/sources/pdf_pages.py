@@ -7,12 +7,14 @@ import io
 import json
 import math
 import re
+import zlib
 from collections import Counter
 from dataclasses import dataclass
 from itertools import pairwise
 
 from pydantic import BaseModel, Field, field_validator
-from pypdf import PdfReader
+from pypdf import PageObject, PdfReader, get_configuration
+from pypdf.generic import ArrayObject, EncodedStreamObject
 
 from powercontext.artifacts import MemoryCitation
 from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
@@ -54,19 +56,75 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
         if reader.is_encrypted and not reader.decrypt(""):
             raise ValueError("PDF requires a nonempty password")  # noqa: TRY003, TRY301
         digest = hashlib.sha256(value.content).hexdigest()
-        return tuple(
-            PDFPageInput(
-                document_id=value.document_id,
-                document_sha256=digest,
-                page_number=number,
-                text=page.extract_text() or "",
+        pages = []
+        for number, page in enumerate(reader.pages, 1):
+            _validate_page_flate(page, number)
+            pages.append(
+                PDFPageInput(
+                    document_id=value.document_id,
+                    document_sha256=digest,
+                    page_number=number,
+                    text=page.extract_text() or "",
+                )
             )
-            for number, page in enumerate(reader.pages, 1)
-        )
+        return tuple(pages)
     except Exception as error:
         # pypdf exposes malformed structures through several exception families,
         # including failures encountered only while decoding a later page stream.
         raise ValueError("Invalid or incompletely readable PDF document") from error  # noqa: TRY003
+
+
+def _validate_flate(data: bytes, output_limit: int) -> None:
+    # Validate framing and checksum, retaining at most one output chunk.
+    decoder = zlib.decompressobj()
+    chunk_size = 64 * 1024
+    produced = 0
+    for offset in range(0, len(data), chunk_size):
+        pending = data[offset : offset + chunk_size]
+        while pending:
+            capacity = min(chunk_size, output_limit - produced + 1) if output_limit else chunk_size
+            output = decoder.decompress(pending, capacity)
+            produced += len(output)
+            if output_limit and produced > output_limit:
+                raise ValueError("PDF content exceeds the configured Flate output limit")  # noqa: TRY003
+            if decoder.eof:
+                # pypdf accepts padding after a complete zlib stream.
+                return
+            tail = decoder.unconsumed_tail
+            if len(tail) == len(pending) and not output:
+                raise ValueError("PDF Flate decoder made no progress")  # noqa: TRY003
+            pending = tail
+    if not decoder.eof:
+        raise ValueError("Incomplete PDF Flate stream")  # noqa: TRY003
+
+
+def _validate_page_flate(page: PageObject, number: int) -> None:
+    # Only direct Contents: chains, Forms and fonts retain pypdf behavior.
+    contents = page.get("/Contents")
+    if contents is None:
+        return
+    contents = contents.get_object()
+    streams = contents if isinstance(contents, ArrayObject) else (contents,)
+    for reference in streams:
+        stream = reference.get_object()
+        if not isinstance(stream, EncodedStreamObject):
+            continue
+        filters = stream.get("/Filter")
+        if filters is None:
+            continue
+        filters = filters.get_object()
+        if isinstance(filters, ArrayObject):
+            if len(filters) != 1:
+                continue
+            filters = filters[0].get_object()
+        if filters not in ("/FlateDecode", "/Fl"):
+            continue
+        try:
+            # Reader-local bytes are decrypted but not decoded. get_data()
+            # would already invoke pypdf's lossy recovery path.
+            _validate_flate(stream._data, get_configuration().zlib_maximum_output_length)
+        except (ValueError, zlib.error) as error:
+            raise ValueError(f"Invalid Flate Contents on physical page {number}") from error  # noqa: TRY003
 
 
 class PDFPageSource(Source):
