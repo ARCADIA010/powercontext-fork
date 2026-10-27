@@ -15,3 +15,28 @@ Tests use the existing competition interpreter with PYTHONDONTWRITEBYTECODE=1, P
 Focused Ruff check/format, ty with explicit shared interpreter, and git diff --check passed. No dependency sync.
 
 Limits: only direct Contents Flate streams including single-filter arrays. Filter chains, Forms, font/ToUnicode, object/xref streams and other warning-based omissions retain prior behavior. Private EncodedStreamObject._data access is isolated and tested with pypdf 6.19.0. Platform quality/resource gates and the unique cause of 0/50 remain unknown.
+
+## Document identity and final acceptance
+
+H3 changes only candidate term counts from body to complete hit.text. Phrase/title text remains body-only; no vocabulary, weights, Memory records or SQL changed. The five-document/21-page counterexample, arbitrary renaming and swapped target assignment failed before the change: 3 failed in 10.74s. All retained exact citations and returned the wrong documents. The failure was the assertion that the explicitly named target must be in the top 20. After the one-line change: 35 passed in 18.77s across all PDF tests, including unnamed queries and two-document comparisons. Raw outputs: h3-before.log and h3-after.log under .artifacts/pdf-contract-fix. Identity matching still requires lexical overlap; this does not guarantee official Recall@20.
+
+Final official command, run from the worktree root:
+
+    PYTEST_ADDOPTS=--basetemp=/root/projects/pc-pdf-contract-fix/.artifacts/pdf-contract-fix/official-tmp make -C competition PYTHON=/root/projects/powercontext/competition/.venv/bin/python test-pdf test-csv test-pi test-rerank test-evidence test-incremental test-count-trigger test-embedding test-lifecycle test-hybrid
+
+Actual output, in command order (exit 0):
+
+    PDF:           6 passed in 33.26s
+    CSV:          17 passed in 2.70s
+    Pi:           15 passed in 6.36s
+    Rerank:       10 passed in 1.75s
+    Evidence:      3 passed in 2.69s
+    Incremental:  14 passed in 1.69s
+    Count-trigger:17 passed in 262.62s (0:04:22)
+    Embedding:     8 passed in 2.85s
+    Lifecycle:     4 passed in 10.56s
+    Hybrid:        1 passed in 34.14s
+
+The Makefile exports PYTHONDONTWRITEBYTECODE=1 and uses this worktree as PRODUCT. Shared dependencies were read only; the official tests were not edited. Raw command output: .artifacts/pdf-contract-fix/official.log. No external SQL was introduced; all tests use public Runtime/Memory APIs.
+
+H2 remains unchanged, including the 8192-byte durable Memory limit. Complex filters, Forms and font streams remain outside preflight coverage. Public acceptance and these regressions do not establish the platform's unique failure cause or a score of 50/50.

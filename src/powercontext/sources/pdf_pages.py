@@ -270,7 +270,7 @@ async def _retrieve_pages(memory, queries: list[str], limit: int) -> list[_PageC
             )
             body = hit.text.partition("\n")[2]
             candidates[key] = _PageCandidate(
-                citation, Counter(_lexeme(term) for term in _terms(body)), " ".join(body.casefold().split())
+                citation, Counter(_lexeme(term) for term in _terms(hit.text)), " ".join(body.casefold().split())
             )
     return list(candidates.values())
 
