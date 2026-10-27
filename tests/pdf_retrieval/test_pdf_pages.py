@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from selftest_support.source_acceptance import persist
 
 from powercontext.builtin.runtime import GetMemoryEntryRequest, open_builtin_runtime
 from powercontext.builtin.scope import ScopeDraft
@@ -20,7 +21,6 @@ from powercontext.sources.pdf_pages import (
     search_pdf_pages,
 )
 from powercontext.sources.projections import TEXT_EVIDENCE_PROJECTION_KEY
-from selftest_support.source_acceptance import persist
 
 
 def pdf_bytes(texts, password=None):
@@ -103,6 +103,28 @@ def test_password_and_late_page_failure_are_atomic():
     raw = raw[:start] + raw[start:].replace(b") Tj ET", b"  Tj ET", 1)
     with pytest.raises(ValueError):
         parse_pdf_document(PDFDocumentInput(document_id="broken-later", content=raw))
+
+
+async def test_full_page_text_survives_the_durable_entry_bound(tmp_path: Path):
+    """A legitimate dense page whose projection exceeds the old 8192-byte bound
+    must persist verbatim and read back exactly; nothing is truncated."""
+
+    dense = "quarterly revenue " * 530
+    pages = parse_pdf_document(PDFDocumentInput(document_id="dense", content=pdf_bytes([dense])))
+    assert pages[0].text == dense
+    projection_bytes = len(f"dense\n{pages[0].text}".encode())
+    assert projection_bytes > 8192
+    registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
+    observations = [project_source_for_transport(registry, await registry.resolve(page)) for page in pages]
+    config, scope_id, stored = await persist(tmp_path, PDF_PAGE_SOURCE_DEFINITION, observations)
+    async with open_builtin_runtime(config) as runtime:
+        memory = runtime.memory.for_scope(scope_id)
+        results = await search_pdf_pages(memory, "quarterly revenue", limit=5)
+        assert len(results) == 1
+        entry = (await memory.get(GetMemoryEntryRequest(citation=results[0]))).entry
+        projection = stored[entry.sources[0].source_id].projection(TEXT_EVIDENCE_PROJECTION_KEY)
+        assert entry.text == projection["content"].strip()
+        assert projection["content"].encode("utf-8") == f"dense\n{dense}".encode()
 
 
 async def test_restarted_memory_retrieves_ranks_deduplicates_and_isolates(tmp_path: Path):

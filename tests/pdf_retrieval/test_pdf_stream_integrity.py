@@ -15,6 +15,7 @@ from pypdf.generic import (
     EncodedStreamObject,
     NameObject,
     NullObject,
+    NumberObject,
 )
 
 from powercontext.sources.pdf_pages import PDFDocumentInput, parse_pdf_document
@@ -150,3 +151,81 @@ def test_preflight_handles_multiple_input_chunks():
 
     payload = random.Random(3701).randbytes(200000)
     _validate_flate(zlib.compress(payload), len(payload))
+
+
+def make_form_pdf(damaged=False):
+    """Text drawn through a Form XObject: extraction recurses into its own stream."""
+
+    writer = PdfWriter()
+    font = writer._add_object(DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    }))
+    page = writer.add_blank_page(width=600, height=800)
+    form = EncodedStreamObject()
+    form[NameObject("/Type")] = NameObject("/XObject")
+    form[NameObject("/Subtype")] = NameObject("/Form")
+    form[NameObject("/BBox")] = ArrayObject([
+        NumberObject(0), NumberObject(0), NumberObject(600), NumberObject(800)
+    ])
+    form[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})
+    })
+    form[NameObject("/Filter")] = NameObject("/FlateDecode")
+    form._data = zlib.compress(b"BT /F1 12 Tf 20 700 Td (Form quarterly revenue increased) Tj ET")
+    if damaged:
+        form._data = form._data[: len(form._data) // 2] + b"x" * 8 + form._data[len(form._data) // 2 + 8 :]
+    form_ref = writer._add_object(form)
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/XObject"): DictionaryObject({NameObject("/Xf1"): form_ref})
+    })
+    contents = DecodedStreamObject()
+    contents.set_data(b"q /Xf1 Do Q")
+    page[NameObject("/Contents")] = writer._add_object(contents)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_damaged_form_xobject_stream_fails_atomically():
+    assert [page.text.strip() for page in parse(make_form_pdf())] == ["Form quarterly revenue increased"]
+    with pytest.raises(ValueError):
+        parse(make_form_pdf(damaged=True))
+
+
+def make_chain_pdf(damaged=False):
+    """Single Contents stream filtered [/FlateDecode, /ASCIIHexDecode].
+
+    pypdf applies decode filters in array order, so the stored payload is
+    zlib.compress(hex(text) + b'>').
+    """
+
+    writer = PdfWriter()
+    font = writer._add_object(DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    }))
+    page = writer.add_blank_page(width=600, height=800)
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})
+    })
+    text = b"BT /F1 12 Tf 20 700 Td (Chain quarterly revenue increased) Tj ET"
+    stream = EncodedStreamObject()
+    stream[NameObject("/Filter")] = ArrayObject([
+        NameObject("/FlateDecode"), NameObject("/ASCIIHexDecode")
+    ])
+    stream._data = zlib.compress(text.hex().encode("ascii") + b">")
+    if damaged:
+        stream._data = stream._data[: len(stream._data) // 2] + b"x" * 8 + stream._data[len(stream._data) // 2 + 8 :]
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_damaged_filter_chain_stage_fails_atomically():
+    assert [page.text.strip() for page in parse(make_chain_pdf())] == ["Chain quarterly revenue increased"]
+    with pytest.raises(ValueError):
+        parse(make_chain_pdf(damaged=True))
