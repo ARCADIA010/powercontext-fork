@@ -320,3 +320,188 @@ def test_withdrawn_topics_are_excluded_before_candidate_limit_and_detail_recall(
             assert {item.artifact_ref.artifact_id for item in page} >= {ref.artifact_id for ref in topics}
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("binding", ["memory", "memory-later-head", "topic"])
+def test_native_reference_has_one_lifecycle_owner_across_restart(tmp_path, binding):
+    async def run():
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'owners.db'}"))
+        second = "second' OR 1=1 --"
+        alias = "alias'; DROP TABLE pc_source_lifecycle; --"
+        async with open_builtin_runtime(config) as runtime:
+            scope, refs = await build(runtime)
+            service = runtime.lifecycle.for_scope(scope)
+            source = (
+                await runtime.sources.for_scope(scope).capture(
+                    CaptureSource(source_id=second, content="independent evidence", metadata={})
+                )
+            ).source_ref
+            await service.register_source(second, source, revision=3)
+            reference = refs["topic"] if binding == "topic" else refs["m0"]
+            if binding == "memory-later-head":
+                reference = reference.model_copy(
+                    update={"memory_ref": (await runtime.memory.for_scope(scope).list()).memory_ref}
+                )
+                assert reference != refs["m0"]
+                await runtime.memory.for_scope(scope).get(GetMemoryEntryRequest(citation=reference))
+
+        for sequence, available in ((1, True), (2, False), (3, True)):
+            async with open_builtin_runtime(config) as runtime:
+                service = runtime.lifecycle.for_scope(scope)
+                await service.apply(event(sequence, available, reason="owner's state; SELECT 1 --"))
+                await assert_visibility(runtime, scope, refs, available)
+                before = (await runtime.memory.for_scope(scope).list(include_inactive=True)).memory_ref
+                for parents in ((second,), ("source",)):
+                    with pytest.raises(SourceLifecycleError, match="native-reference-already-bound"):
+                        if binding == "topic":
+                            await service.register_topic(alias, reference, parents=parents)
+                        else:
+                            await service.register_memory(alias, reference, parents=parents)
+                assert (await runtime.memory.for_scope(scope).list(include_inactive=True)).memory_ref == before
+                with pytest.raises(SourceLifecycleError):
+                    await service.resolve(alias, purpose="audit")
+                # The original binding remains idempotent even while withdrawn.
+                await service.register_memory("m0", refs["m0"], parents=("source",))
+                await service.register_topic("topic", refs["topic"], parents=("m0", "m1"))
+                # Independent Source transitions must never control these native references.
+                await service.apply(event(sequence, not available, node_id=second))
+                active = await service.apply(event(sequence, available, reason="owner's state; SELECT 1 --"))
+                assert alias not in active
+                assert ("m0" in active) == available
+                assert ("topic" in active) == available
+                await assert_visibility(runtime, scope, refs, available)
+        async with open_builtin_runtime(config) as runtime:
+            await assert_visibility(runtime, scope, refs, True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("binding", ["memory", "topic"])
+def test_legacy_duplicate_bindings_fail_closed_but_preserve_audit(tmp_path, binding):
+    async def run():
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'legacy.db'}"))
+        async with open_builtin_runtime(config) as runtime:
+            scope, refs = await build(runtime)
+            service = runtime.lifecycle.for_scope(scope)
+            store = service.store
+            async with store.database.transaction() as connection:
+                nodes = await store.load(connection, scope)
+                original = nodes["m0" if binding == "memory" else "topic"]
+                # Reproduce a database written by the earlier alias-accepting implementation.
+                legacy = original.model_copy(update={"node_id": "legacy-alias"})
+                await store.save(connection, scope, legacy, new=True)
+        async with open_builtin_runtime(config) as runtime:
+            service = runtime.lifecycle.for_scope(scope)
+            before = (await runtime.memory.for_scope(scope).list()).memory_ref
+            with pytest.raises(SourceLifecycleError, match="native-reference-already-bound"):
+                await service.apply(event())
+            with pytest.raises(SourceLifecycleError, match="native-reference-already-bound"):
+                await service.resolve(original.node_id)
+            with pytest.raises(SourceLifecycleError, match="native-reference-already-bound"):
+                await service.register_source("source", refs["source"], revision=3)
+            assert await service.resolve("legacy-alias", purpose="audit") == original.reference
+            assert (await runtime.memory.for_scope(scope).list()).memory_ref == before
+            assert all(row.state == "active" for row in (await runtime.memory.for_scope(scope).list()).entries)
+
+    asyncio.run(run())
+
+
+def test_topic_revisions_share_native_identity(tmp_path):
+    async def run():
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'revisions.db'}"))
+        async with open_builtin_runtime(config) as runtime:
+            scope, _refs = await build(runtime)
+            first = await topic(runtime, scope, "revisionneedle")
+            record = await runtime.records.for_scope(scope).get_artifact("topic-memory", first.artifact_id)
+            second = await runtime.records.for_scope(scope).replace_artifact(
+                "topic-memory",
+                first.artifact_id,
+                f'"revision:{record.revision}"',
+                ArtifactWrite(content={"title": "revisionneedle", "summary": "revisionneedle", "detail": "second"}),
+            )
+            second = ArtifactRef(family="topic-memory", artifact_id=second.artifact_id, revision=second.revision)
+            assert first != second
+            service = runtime.lifecycle.for_scope(scope)
+            await service.register_topic("first", first, parents=("source",))
+        async with open_builtin_runtime(config) as runtime:
+            service = runtime.lifecycle.for_scope(scope)
+            with pytest.raises(SourceLifecycleError, match="native-reference-already-bound"):
+                await service.register_topic("second", second, parents=("source",))
+            for sequence, available in ((1, False), (2, True)):
+                await service.apply(event(sequence, available))
+                hits = (
+                    await runtime.topic_memory.for_scope(scope).search(SearchTopicMemoryRequest(query="revisionneedle"))
+                ).hits
+                assert bool(hits) == available
+                assert await service.resolve("first", purpose="audit") == first
+                exact = await runtime.topic_memory.for_scope(scope).get(GetTopicMemoryRequest(artifact=first))
+                assert exact.topic.as_ref() == first
+
+    asyncio.run(run())
+
+
+def test_alternative_sources_use_one_any_binding_across_restart(tmp_path):
+    async def run():
+        config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'alternatives.db'}"))
+        async with open_builtin_runtime(config) as runtime:
+            scope = (
+                await runtime.scopes.create(ScopeDraft(title="any", summary="evidence", idempotency_key="any"))
+            ).scope_id
+            service = runtime.lifecycle.for_scope(scope)
+            for node_id in ("a", "b"):
+                reference = (
+                    await runtime.sources.for_scope(scope).capture(
+                        CaptureSource(source_id=node_id, content=node_id, metadata={})
+                    )
+                ).source_ref
+                await service.register_source(node_id, reference, revision=3)
+            citation = (
+                await runtime.memory.for_scope(scope).remember(
+                    RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="alternativeneedle evidence"),))
+                )
+            ).entry.citation
+            topic_ref = await topic(runtime, scope, "alternativetopic", "alternativedetail")
+            await service.register_memory("memory", citation, parents=("a", "b"), policy="any")
+            await service.register_topic("topic", topic_ref, parents=("a", "b"), policy="any")
+        for root, sequence, available, expected in (
+            ("a", 1, False, True),
+            ("b", 1, False, False),
+            ("a", 2, True, True),
+            ("b", 2, True, True),
+        ):
+            async with open_builtin_runtime(config) as runtime:
+                service = runtime.lifecycle.for_scope(scope)
+                active = await service.apply(event(sequence, available, node_id=root))
+                assert ("memory" in active) == expected
+                assert ("topic" in active) == expected
+                entries = (await runtime.memory.for_scope(scope).list(include_inactive=True)).entries
+                assert (entries[0].state == "active") == expected
+                assert (
+                    bool(
+                        (
+                            await runtime.memory.for_scope(scope).search(
+                                SearchMemoryRequest(query="alternativeneedle", mode="fts")
+                            )
+                        ).hits
+                    )
+                    == expected
+                )
+                assert (
+                    bool(
+                        (
+                            await runtime.topic_memory.for_scope(scope).search(
+                                SearchTopicMemoryRequest(query="alternativedetail")
+                            )
+                        ).hits
+                    )
+                    == expected
+                )
+                for name, reference in (("memory", citation), ("topic", topic_ref)):
+                    assert await service.resolve(name, purpose="audit") == reference
+                    if expected:
+                        assert await service.resolve(name) == reference
+                    else:
+                        with pytest.raises(SourceLifecycleError):
+                            await service.resolve(name)
+
+    asyncio.run(run())

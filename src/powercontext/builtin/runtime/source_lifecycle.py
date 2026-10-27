@@ -18,6 +18,15 @@ Every mutation explicitly binds the graph, event identity, Memory manifest and
 search projections to one database transaction. An exception (including task
 cancellation) rolls back the event sequence together with all native effects.
 A committed replay performs no native writes. No pending work lives in memory.
+
+Each native Memory entry or Topic has exactly one lifecycle owner per scope:
+Memory identity is (artifact_id, entry_id), independent of the citation's head
+revision; Topic identity is artifact_id, independent of its revision. A second
+node cannot bind the same native state, even with identical parents. Express
+alternative support using one node with multiple parents and policy="any".
+Source aliases have independent lifecycle event streams and no native status.
+Graphs persisted by older versions with duplicate native owners are rejected
+before generation or mutation; original references remain accessible for audit.
 """
 
 from __future__ import annotations
@@ -86,8 +95,27 @@ class _Node(BaseModel):
     available: bool = True
     last_event: SourceLifecycleEvent | None = None
 
+    def native_identity(self) -> tuple[str, str, str] | None:
+        if isinstance(self.reference, MemoryCitation):
+            return ("memory", self.reference.memory_ref.artifact_id, self.reference.entry_id)
+        if isinstance(self.reference, ArtifactRef):
+            return ("topic", self.reference.artifact_id, "")
+        return None
+
     def registration(self) -> dict[str, object]:
         return self.model_dump(exclude={"available", "last_event"})
+
+
+def _require_unique_native_bindings(nodes: Sequence[_Node]) -> None:
+    owners: dict[tuple[str, str, str], str] = {}
+    for node in nodes:
+        identity = node.native_identity()
+        if identity is None:
+            continue
+        owner = owners.get(identity)
+        if owner is not None:
+            raise SourceLifecycleError(f"native-reference-already-bound:{owner}")
+        owners[identity] = node.node_id
 
 
 class SourceLifecycleStore:
@@ -230,11 +258,13 @@ class ScopedSourceLifecycle:
     async def _register(self, node: _Node) -> None:
         async with self._transaction() as (store, connection):
             nodes = await store.load(connection, self.scope_id)
+            _require_unique_native_bindings(tuple(nodes.values()))
             existing = nodes.get(node.node_id)
             if existing is not None:
                 if existing.registration() != node.registration():
                     raise SourceLifecycleError("conflicting-registration")
                 return
+            _require_unique_native_bindings((*nodes.values(), node))
             if any(parent not in nodes for parent in node.parents):
                 raise SourceLifecycleError("parents-must-already-be-registered-in-this-scope")
             await store.validate_reference(connection, self.scope_id, node)
@@ -249,6 +279,7 @@ class ScopedSourceLifecycle:
             raise SourceLifecycleError("SourceLifecycleEvent-is-required")
         async with self._transaction() as (store, connection):
             nodes = await store.load(connection, self.scope_id)
+            _require_unique_native_bindings(tuple(nodes.values()))
             source = nodes.get(event.node_id)
             if source is None or source.kind != "source" or source.revision != event.revision:
                 raise SourceLifecycleError("event-requires-a-registered-Source-with-matching-revision")
@@ -287,7 +318,10 @@ class ScopedSourceLifecycle:
         if purpose not in ("generation", "audit"):
             raise SourceLifecycleError("purpose-must-be-generation-or-audit")
         async with self._transaction() as (store, connection):
-            node = (await store.load(connection, self.scope_id)).get(node_id)
+            nodes = await store.load(connection, self.scope_id)
+            if purpose == "generation":
+                _require_unique_native_bindings(tuple(nodes.values()))
+            node = nodes.get(node_id)
             if node is None or (purpose == "generation" and not node.available):
                 raise SourceLifecycleError("unknown-or-unavailable-node")
             return node.reference
