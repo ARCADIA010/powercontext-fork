@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from itertools import chain
+from itertools import chain, pairwise
 from typing import TypeVar
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
@@ -106,6 +109,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """A literal character interval in one exactly addressed Memory entry version."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -211,6 +225,8 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return _build_evidence(request, memory_candidates)
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -276,6 +292,14 @@ class PreparedContextBuilder:
         the same inputs as :meth:`build_scopes_result` are guaranteed to yield the same
         counters because both go through :meth:`_select_entries`.
         """
+
+        if request.evidence_selection:
+            build = _build_evidence(request, memory_candidates)
+            return RecallBudgetView(
+                max_bytes=request.max_bytes,
+                delivered_items=len(build.fragments),
+                unused_bytes=max(0, request.max_bytes - build.context.content_bytes),
+            )
 
         content, origins, omissions = self._select_entries(
             request=request,
@@ -728,3 +752,229 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+@dataclass(frozen=True)
+class _EvidencePassage:
+    fragment: PreparedContextFragment
+    score: float
+    original: str
+    matches: tuple[tuple[int, int], ...]
+
+
+def _evidence_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    stopwords = {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "on",
+        "at",
+        "for",
+        "from",
+        "by",
+        "with",
+        "as",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "how",
+        "what",
+        "which",
+        "when",
+        "where",
+        "who",
+        "does",
+        "do",
+        "did",
+        "has",
+        "have",
+        "had",
+    }
+    for match in re.finditer(r"[\u3400-\u9fff]+|[^\W\d_]+|\d+", text.casefold()):
+        word = match.group()
+        if "\u3400" <= word[0] <= "\u9fff":
+            terms.extend(word)
+            terms.extend(word[index : index + 2] for index in range(len(word) - 1))
+        elif word not in stopwords:
+            if len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+                word = word[:-1]
+            terms.append(word)
+    return terms
+
+
+def _sentence_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for match in re.finditer(r"[。！？!?]+|\.(?!\d)(?=\s|$)|\n+|$", text):  # noqa: RUF001
+        end = match.end()
+        left, right = start, end
+        while left < right and text[left].isspace():
+            left += 1
+        while right > left and text[right - 1].isspace():
+            right -= 1
+        if left < right:
+            ranges.append((left, right))
+        start = end
+    return tuple(ranges)
+
+
+def _evidence_passages(query: str, groups: Sequence[PreparedMemoryCandidates]) -> tuple[_EvidencePassage, ...]:
+    query_terms = _evidence_terms(query)
+    wanted = set(query_terms)
+    entries: list[tuple[MemoryEntryAddress, str]] = []
+    for group in groups:
+        for hit in group.hits:
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            if not any(existing == address for existing, _ in entries):
+                entries.append((address, hit.text))
+    frequencies = Counter(term for _, text in entries for term in wanted.intersection(_evidence_terms(text)))
+    weights = {term: 1 + math.log((len(entries) + 1) / (frequencies[term] + 0.5)) for term in wanted}
+    pairs = set(pairwise(query_terms))
+    passages: list[_EvidencePassage] = []
+    for address, text in entries:
+        seen_text: set[str] = set()
+        sentences: list[_EvidencePassage] = []
+        for start, end in _sentence_ranges(text):
+            body = text[start:end]
+            if body in seen_text:
+                continue
+            seen_text.add(body)
+            terms = _evidence_terms(body)
+            matched = wanted.intersection(terms)
+            score = sum(weights[term] for term in matched)
+            score *= 1 + len(matched) / max(1, len(wanted))
+            score += sum(1 for pair in pairwise(terms) if pair in pairs)
+            score /= 0.8 + 0.2 * max(1, len(terms)) / 40
+            matches = tuple(
+                (start + match.start(), start + match.end())
+                for match in re.finditer(r"[\u3400-\u9fff]+|[^\W\d_]+|\d+", body)
+                if wanted.intersection(_evidence_terms(match.group()))
+            )
+            sentences.append(_EvidencePassage(PreparedContextFragment(address, start, end, body), score, text, matches))
+        for index, passage in enumerate(sentences):
+            if passage.score == 0:
+                neighbors = sentences[max(0, index - 1) : index] + sentences[index + 1 : index + 2]
+                passage = replace(passage, score=max((item.score for item in neighbors), default=0) * 0.25)
+            if passage.score > 0:
+                passages.append(passage)
+    return tuple(sorted(passages, key=lambda passage: -passage.score))
+
+
+def _merge_evidence(
+    selected: Sequence[PreparedContextFragment], candidate: PreparedContextFragment, text: str
+) -> tuple[PreparedContextFragment, ...]:
+    merged = candidate
+    absorbed: set[int] = set()
+    while True:
+        previous = len(absorbed)
+        for index, fragment in enumerate(selected):
+            if index in absorbed or fragment.address != merged.address:
+                continue
+            gap_start, gap_end = min(merged.end, fragment.end), max(merged.start, fragment.start)
+            if text[gap_start:gap_end].strip():
+                continue
+            absorbed.add(index)
+            start, end = min(merged.start, fragment.start), max(merged.end, fragment.end)
+            merged = PreparedContextFragment(merged.address, start, end, text[start:end])
+        if len(absorbed) == previous:
+            break
+    result = [fragment for index, fragment in enumerate(selected) if index not in absorbed]
+    result.insert(min(absorbed, default=len(selected)), merged)
+    return tuple(result)
+
+
+def _render_evidence(fragments: Sequence[PreparedContextFragment]) -> str:
+    items = [
+        {
+            "citation": {
+                "scope_id": fragment.address.memory.scope_id,
+                "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                "entry_id": fragment.address.entry_id,
+                "entry_version_id": fragment.address.entry_version_id,
+            },
+            "content": fragment.text,
+            "start": fragment.start,
+            "end": fragment.end,
+        }
+        for fragment in fragments
+    ]
+    envelope = json.dumps({"trust": "untrusted_history", "items": items}, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{envelope}\n{_END_MARKER}"))
+
+
+def _fit_evidence_window(
+    passage: _EvidencePassage,
+    selected: tuple[PreparedContextFragment, ...],
+    text: str,
+    max_bytes: int,
+) -> tuple[PreparedContextFragment, ...] | None:
+    fragment = passage.fragment
+    # Center long passages on the densest query occurrence, retaining literal offsets.
+    anchor = max(
+        passage.matches,
+        key=lambda match: sum(abs(other[0] - match[0]) < 160 for other in passage.matches),
+        default=(fragment.start, fragment.start + 1),
+    )
+    lower, upper = max(48, anchor[1] - anchor[0]), fragment.end - fragment.start
+    best: tuple[PreparedContextFragment, ...] | None = None
+    while lower <= upper:
+        width = (lower + upper) // 2
+        start = max(fragment.start, min((anchor[0] + anchor[1] - width) // 2, fragment.end - width))
+        end = min(fragment.end, start + width)
+        candidate = PreparedContextFragment(fragment.address, start, end, text[start:end])
+        trial = _merge_evidence(selected, candidate, text)
+        if len(_render_evidence(trial).encode("utf-8")) <= max_bytes:
+            best = trial
+            lower = width + 1
+        else:
+            upper = width - 1
+    return best
+
+
+def _build_evidence(request: PrepareContextRequest, groups: Sequence[PreparedMemoryCandidates]) -> PreparedContextBuild:
+    passages = _evidence_passages(request.query, groups)
+    selected: tuple[PreparedContextFragment, ...] = ()
+    deferred: list[_EvidencePassage] = []
+    for passage in passages:
+        trial = _merge_evidence(selected, passage.fragment, passage.original)
+        if len(_render_evidence(trial).encode("utf-8")) <= request.max_bytes:
+            selected = trial
+        elif not selected:
+            fitted = _fit_evidence_window(passage, selected, passage.original, request.max_bytes)
+            if fitted is not None:
+                selected = fitted
+        else:
+            deferred.append(passage)
+    # Prefer complete sentences; use hit-centered windows only with the remaining budget.
+    for passage in deferred:
+        fitted = _fit_evidence_window(passage, selected, passage.original, request.max_bytes)
+        if fitted is not None:
+            selected = fitted
+    if not selected:
+        return PreparedContextBuild(context=PreparedContext(status="empty", content=None, content_bytes=0), origins=())
+    content = _render_evidence(selected)
+    return PreparedContextBuild(
+        context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+        origins=tuple(fragment.address for fragment in selected),
+        fragments=selected,
+    )
