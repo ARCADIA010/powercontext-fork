@@ -14,7 +14,8 @@ from itertools import pairwise
 
 from pydantic import BaseModel, Field, field_validator
 from pypdf import PageObject, PdfReader, get_configuration
-from pypdf.generic import ArrayObject, EncodedStreamObject
+from pypdf.filters import ASCII85Decode, ASCIIHexDecode, FlateDecode
+from pypdf.generic import ArrayObject, DictionaryObject, EncodedStreamObject, IndirectObject
 
 from powercontext.artifacts import MemoryCitation
 from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
@@ -75,56 +76,120 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
 
 
 def _validate_flate(data: bytes, output_limit: int) -> None:
-    # Validate framing and checksum, retaining at most one output chunk.
+    _decode_flate(data, output_limit, keep=False)
+
+
+def _decode_flate(data: bytes, output_limit: int, *, keep: bool) -> bytes:
+    # Validate framing and checksum; with keep=True the bounded output is retained
+    # so a following chain stage is replayed against real decoded data.
     decoder = zlib.decompressobj()
     chunk_size = 64 * 1024
     produced = 0
+    kept = bytearray()
     for offset in range(0, len(data), chunk_size):
         pending = data[offset : offset + chunk_size]
         while pending:
             capacity = min(chunk_size, output_limit - produced + 1) if output_limit else chunk_size
-            output = decoder.decompress(pending, capacity)
-            produced += len(output)
+            decoded = decoder.decompress(pending, capacity)
+            produced += len(decoded)
             if output_limit and produced > output_limit:
                 raise ValueError("PDF content exceeds the configured Flate output limit")  # noqa: TRY003
+            if keep:
+                kept.extend(decoded)
             if decoder.eof:
                 # pypdf accepts padding after a complete zlib stream.
-                return
+                return bytes(kept)
             tail = decoder.unconsumed_tail
-            if len(tail) == len(pending) and not output:
+            if len(tail) == len(pending) and not decoded:
                 raise ValueError("PDF Flate decoder made no progress")  # noqa: TRY003
             pending = tail
-    if not decoder.eof:
-        raise ValueError("Incomplete PDF Flate stream")  # noqa: TRY003
+    raise ValueError("Incomplete PDF Flate stream")  # noqa: TRY003
+
+
+# Chain stages whose decoded output is deterministic enough to replay the next
+# stage's input; anything else stops the replay and keeps pypdf behavior.
+_CHAIN_PASSTHROUGH = {
+    "/ASCIIHexDecode": ASCIIHexDecode,
+    "/AHx": ASCIIHexDecode,
+    "/ASCII85Decode": ASCII85Decode,
+    "/A85": ASCII85Decode,
+}
+_XOBJECT_VISIT_LIMIT = 256
+
+
+def _validate_encoded_stream(stream: EncodedStreamObject, number: int, label: str) -> None:
+    """Replay decodable filter stages strictly, before pypdf's lossy recovery."""
+
+    filters = stream.get("/Filter")
+    if filters is None:
+        return
+    filters = filters.get_object()
+    stages = list(filters) if isinstance(filters, ArrayObject) else [filters]
+    decode_parms = stream.get("/DecodeParms", (DictionaryObject(),) * len(stages))
+    if not isinstance(decode_parms, (list, tuple)):
+        decode_parms = (decode_parms,)
+    data = stream._data
+    try:
+        # pypdf's decode_stream_data pairs stages with plain zip truncation;
+        # keep that exact semantics instead of rejecting short DecodeParms.
+        for index, (stage, params) in enumerate(zip(stages, decode_parms, strict=False)):
+            name = stage.get_object()
+            final = index == len(stages) - 1
+            if name in ("/FlateDecode", "/Fl"):
+                _decode_flate(data, get_configuration().zlib_maximum_output_length, keep=not final)
+                if final:
+                    return
+                if isinstance(params, IndirectObject):
+                    params = params.get_object()
+                # Strict validation already passed, so this cannot hit the lossy path.
+                data = FlateDecode.decode(data, params if isinstance(params, DictionaryObject) else None)
+            elif not final and name in _CHAIN_PASSTHROUGH:
+                data = _CHAIN_PASSTHROUGH[name].decode(data)
+            else:
+                # Filters we cannot replay deterministically keep pypdf behavior.
+                return
+    except (ValueError, zlib.error) as error:
+        raise ValueError(f"Invalid Flate {label} on physical page {number}") from error  # noqa: TRY003
+
+
+def _validate_form_xobjects(resources: object, number: int, seen: set[int]) -> None:
+    # Text-bearing Forms: pypdf tolerates damaged Flate data there with only a
+    # logged warning, so integrity is checked wherever extraction will read.
+    if isinstance(resources, IndirectObject):
+        resources = resources.get_object()
+    if not isinstance(resources, DictionaryObject) or len(seen) >= _XOBJECT_VISIT_LIMIT:
+        return
+    xobjects = resources.get("/XObject")
+    if xobjects is None:
+        return
+    xobjects = xobjects.get_object()
+    if not isinstance(xobjects, DictionaryObject):
+        return
+    for reference in xobjects.values():
+        if len(seen) >= _XOBJECT_VISIT_LIMIT:
+            return
+        stream = reference.get_object()
+        marker = id(stream)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if not isinstance(stream, DictionaryObject) or stream.get("/Subtype") == "/Image":
+            continue
+        if isinstance(stream, EncodedStreamObject):
+            _validate_encoded_stream(stream, number, "XObject stream")
+        _validate_form_xobjects(stream.get("/Resources"), number, seen)
 
 
 def _validate_page_flate(page: PageObject, number: int) -> None:
-    # Only direct Contents: chains, Forms and fonts retain pypdf behavior.
     contents = page.get("/Contents")
-    if contents is None:
-        return
-    contents = contents.get_object()
-    streams = contents if isinstance(contents, ArrayObject) else (contents,)
-    for reference in streams:
-        stream = reference.get_object()
-        if not isinstance(stream, EncodedStreamObject):
-            continue
-        filters = stream.get("/Filter")
-        if filters is None:
-            continue
-        filters = filters.get_object()
-        if isinstance(filters, ArrayObject):
-            if len(filters) != 1:
-                continue
-            filters = filters[0].get_object()
-        if filters not in ("/FlateDecode", "/Fl"):
-            continue
-        try:
-            # Reader-local bytes are decrypted but not decoded. get_data()
-            # would already invoke pypdf's lossy recovery path.
-            _validate_flate(stream._data, get_configuration().zlib_maximum_output_length)
-        except (ValueError, zlib.error) as error:
-            raise ValueError(f"Invalid Flate Contents on physical page {number}") from error  # noqa: TRY003
+    if contents is not None:
+        contents = contents.get_object()
+        streams = contents if isinstance(contents, ArrayObject) else (contents,)
+        for reference in streams:
+            stream = reference.get_object()
+            if isinstance(stream, EncodedStreamObject):
+                _validate_encoded_stream(stream, number, "Contents")
+    _validate_form_xobjects(page.get("/Resources"), number, set())
 
 
 class PDFPageSource(Source):
@@ -203,12 +268,60 @@ def _terms(text: str) -> list[str]:
 # Query aliases are financial vocabulary, independent of document identity or page.
 # They only affect retrieval; captured Source text and exact citations stay original.
 _CONCEPT_ALIASES = (
-    ("capex", "capital expenditure", "capital expenditures", "capital spending"),
+    ("capex", "capital expenditure", "capital expenditures", "capital spending", "capital intensive", "capital intensity"),
     ("d&a", "depreciation and amortization", "depreciation and amortisation"),
     ("operating income", "operating profit"),
-    ("income statement", "statement of income", "earnings statement", "p&l", "profit and loss"),
-    ("cash flow statement", "statement of cash flows"),
-    ("segment", "segments", "division", "divisions"),
+    (
+        "income statement",
+        "statement of income",
+        "statements of income",
+        "statement of operations",
+        "statements of operations",
+        "statements of earnings",
+        "earnings statement",
+        "p&l",
+        "profit and loss",
+        "gross margin",
+        "gross profit",
+        "operating margin",
+        "net margin",
+        "profit margin",
+        "net income",
+        "net earnings",
+        "profitability",
+    ),
+    (
+        "balance sheet",
+        "balance sheets",
+        "statement of financial position",
+        "quick ratio",
+        "current ratio",
+        "cash ratio",
+        "liquidity",
+        "working capital",
+        "solvency",
+    ),
+    (
+        "cash flow statement",
+        "statement of cash flows",
+        "statements of cash flows",
+        "cash flow",
+        "cash flows",
+        "free cash flow",
+    ),
+    ("segment", "segments", "division", "divisions", "product categories", "product category", "service categories", "service category"),
+    (
+        "tax",
+        "taxes",
+        "tax rate",
+        "effective tax rate",
+        "income tax",
+        "tax expense",
+        "provision for income taxes",
+        "provision for taxes",
+    ),
+    ("debt", "debts", "borrowings", "long-term debt", "debt obligations", "notes payable"),
+    ("inventory", "inventories", "inventory turnover", "cost of goods sold", "cost of products sold", "cost of sales"),
     ("geography", "geographies", "geographic", "footprint", "regions", "countries", "territories"),
     ("lawsuit", "lawsuits", "litigation", "legal proceedings"),
     ("rental", "rentals", "lease", "leases"),
