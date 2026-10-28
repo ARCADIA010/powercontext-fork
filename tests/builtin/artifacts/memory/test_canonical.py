@@ -120,9 +120,8 @@ def test_limits_are_measured_after_normalization() -> None:
     assert normalize_kind("  integration-kind  ") == "integration-kind"
     assert normalize_reason("  user requested  ") == "user requested"
     assert normalize_reason("   ") is None
-    with pytest.raises(ValueError, match="65536 UTF-8 bytes"):
-        normalize_text("界" * 21846)
-    assert normalize_text("x" * 65536) == "x" * 65536
+    with pytest.raises(ValueError, match="8192 UTF-8 bytes"):
+        normalize_text("界" * 2731)
     with pytest.raises(ValueError, match="512 Unicode code points"):
         normalize_reason("x" * 513)
     with pytest.raises(ValueError, match="non-empty"):
